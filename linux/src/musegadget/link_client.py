@@ -171,9 +171,11 @@ class LinkSession:
         connect=None,
         app_id: str | None = None,
         register_device: bool = True,
+        proxy: str | None = None,
     ) -> None:
         self._url = noise_url(noise_host, vm_id, app_id)
         self._register_device = register_device
+        self._proxy = proxy
         self._transport_ready = asyncio.Event()
         self._token = vm_auth_token
         self._device = device
@@ -285,6 +287,7 @@ class LinkSession:
                 ping_interval=PING_INTERVAL_S,
                 ping_timeout=PING_INTERVAL_S,
                 max_size=128 * 1024,
+                proxy=self._proxy,
             )
         except InvalidStatus as exc:
             status = exc.response.status_code
