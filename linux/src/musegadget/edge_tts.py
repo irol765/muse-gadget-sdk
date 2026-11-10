@@ -1,12 +1,13 @@
 """Free backup TTS route: Microsoft Edge read-aloud synthesis.
 
-Used only when the primary (direct Azure) route fails. Voice and
-prosody follow the configuration the user already runs on the
-ThinkSmart View gateway (xiaozhi-hub-server): data/.config.yaml
-TTS.EdgeTTS voice zh-CN-XiaoxiaoNeural, provider defaults rate +0%,
-pitch +0Hz, volume +0% (core/providers/tts/edge.py). The backup voice
-deliberately differs from the primary Yunxi voice so a failover is
-audible as a failover. Transport needs only
+Used only when the primary (direct Azure) route fails. Access
+method and prosody follow the configuration the user already runs
+on the ThinkSmart View gateway (xiaozhi-hub-server,
+core/providers/tts/edge.py): rate +0%, pitch +0Hz, volume +0%. The
+voice itself deliberately does NOT follow that config (it names
+Xiaoxiao; the user ruled it out on 2026-11-10): the backup speaks
+zh-CN-YunxiNeural, the same voice as the primary route, so all
+routes sound like the same assistant. Transport needs only
 ``websockets`` (already a package dependency); the service answers
 MP3, decoded to 24 kHz WAV with ``miniaudio``.
 
@@ -517,7 +518,7 @@ _EDGE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 "
             "Safari/537.36 Edg/143.0.0.0")
 _EDGE_ORIGIN = "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold"
-EDGE_VOICE = "zh-CN-XiaoxiaoNeural"  # per the gateway config (see header)
+EDGE_VOICE = "zh-CN-YunxiNeural"  # unified voice; NOT the gateway's Xiaoxiao
 EDGE_TIMEOUT_S = 20.0
 
 

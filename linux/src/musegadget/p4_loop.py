@@ -34,8 +34,8 @@ Deliberate v1 choices:
   2 MiB voice-note limit). Without a VAD sidecar, the energy rule
   (RMS >= 100, same frame counts) is the fallback, never the primary.
 - TTS leg: direct Azure synthesis first (voice zh-CN-YunxiNeural,
-  15 s timeout), Edge read-aloud synthesis second (free, voice
-  zh-CN-XiaoxiaoNeural per the gateway's EdgeTTS configuration).
+  15 s timeout), Edge read-aloud synthesis second (free, same
+  Yunxi voice).
   No local synthesis fallback (WK-230): both routes failing only fails
   the speak step, with both errors logged; the round still ends
   cleanly and the reply text is kept for the diagnostic path.
@@ -111,7 +111,7 @@ DEFAULT_ARECORD_DEVICE = "hw:BT600,0"
 DEFAULT_APLAY_DEVICE = "plughw:BT600,0"
 
 # TTS leg: direct Azure first (paid primary), Edge read-aloud second
-# (free backup, gateway-configured voice). No local synthesis: a reply text
+# (free backup, same Yunxi voice). No local synthesis: a reply text
 # only exists when the network is up, so an offline Piper voice could
 # never speak it either (WK-230). Both routes failing means silence
 # plus a log line naming both errors.
@@ -336,9 +336,9 @@ def yunxi_synthesize(text: str) -> bytes:
 
 
 def edge_synthesize(text: str) -> bytes:
-    """Free backup synthesis via Edge read-aloud (voice per the
-    gateway's EdgeTTS config, zh-CN-XiaoxiaoNeural). Raises on any
-    failure; there is no third leg."""
+    """Free backup synthesis via Edge read-aloud (same Yunxi voice
+    as the primary route). Raises on any failure; there is no
+    third leg."""
     from musegadget.edge_tts import synthesize_edge_wav
 
     return synthesize_edge_wav(text)
