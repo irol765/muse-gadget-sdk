@@ -33,11 +33,11 @@ Deliberate v1 choices:
   discards it, 30 s is the hard cap (24 kHz mono stays under the
   2 MiB voice-note limit). Without a VAD sidecar, the energy rule
   (RMS >= 100, same frame counts) is the fallback, never the primary.
-- TTS leg, mirroring the Pi3 client: direct Azure synthesis first
-  (voice zh-CN-YunxiNeural, 15 s timeout), local Piper CLI as fallback.
-  A missing key file or a missing Piper install only fails the speak
-  step; the round still ends cleanly and the reply text is kept for the
-  diagnostic path.
+- TTS leg: direct Azure synthesis first (voice zh-CN-YunxiNeural,
+  15 s timeout), Edge read-aloud synthesis second (free, same voice).
+  No local synthesis fallback (WK-230): both routes failing only fails
+  the speak step, with both errors logged; the round still ends
+  cleanly and the reply text is kept for the diagnostic path.
 - Filler (copied from Pi3, not re-synthesized): /root/filler/ (37 WAVs
   + phrases.json) + /root/filler.py (pools + shuffle-deck pick).
   Receipt plays after recording ends; waiting plays every 10 s
@@ -109,14 +109,15 @@ DEFAULT_PROMPT = "/root/filler/haoqingshuo.wav"
 DEFAULT_ARECORD_DEVICE = "hw:BT600,0"
 DEFAULT_APLAY_DEVICE = "plughw:BT600,0"
 
-# TTS leg (Pi3 client shape): direct Azure first, local Piper fallback.
+# TTS leg: direct Azure first (paid primary), Edge read-aloud second
+# (free backup, same voice). No local synthesis fallback: a reply text
+# only exists when the network is up, so an offline Piper voice could
+# never speak it either (WK-230). Both routes failing means silence
+# plus a log line naming both errors.
 TTS_KEY_FILE = "/root/voiceloop/.azure-key"
 TTS_ENDPOINT = "https://eastasia.tts.speech.microsoft.com/cognitiveservices/v1"
 TTS_VOICE = "zh-CN-YunxiNeural"
 TTS_TIMEOUT_S = 15
-PIPER_BIN = "/root/piper/piper/piper"
-PIPER_MODEL = "/root/piper/voices/zh_CN-huayan-medium.onnx"
-PIPER_TIMEOUT_S = 180
 REPLY_TIMEOUT_S = 180
 MAX_SUBSCRIBE_SKIPS = 10
 
@@ -311,7 +312,7 @@ def build_ssml(text: str) -> bytes:
 def yunxi_synthesize(text: str) -> bytes:
     """Direct Azure synthesis (no SDK, stdlib urllib only, same shape as
     the Pi3 TTS server). Raises on a missing key file or any failure;
-    the caller falls back to Piper."""
+    the caller falls back to the Edge route."""
     key = Path(TTS_KEY_FILE).read_text(encoding="utf-8").strip()
     if not key:
         raise ValueError("TTS key file is empty")
@@ -333,37 +334,31 @@ def yunxi_synthesize(text: str) -> bytes:
     return data
 
 
-def piper_synthesize(text: str) -> bytes:
-    """Local Piper CLI fallback (same binary/model paths as the Pi3
-    client). Raises when the binary or the model is missing."""
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
-        out_path = handle.name
-    try:
-        subprocess.run(
-            [PIPER_BIN, "--model", PIPER_MODEL, "--output_file", out_path],
-            input=text.encode("utf-8"),
-            timeout=PIPER_TIMEOUT_S,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True,
-        )
-        data = Path(out_path).read_bytes()
-    finally:
-        try:
-            os.unlink(out_path)
-        except OSError:
-            pass
-    if not data.startswith(b"RIFF"):
-        raise ValueError("Piper did not produce WAV audio")
-    return data
+def edge_synthesize(text: str) -> bytes:
+    """Free backup synthesis via Edge read-aloud (same Yunxi voice as
+    the primary route). Raises on any failure; there is no third leg."""
+    from musegadget.edge_tts import synthesize_edge_wav
+
+    return synthesize_edge_wav(text, voice=TTS_VOICE)
 
 
 def _synthesize_with_fallback(text: str) -> bytes:
+    """Primary Azure, backup Edge. Both failing raises a RuntimeError
+    carrying both routes' errors so the failure is never silent."""
     try:
         return yunxi_synthesize(text)
-    except Exception as exc:
-        log.warning("direct TTS failed (%s), falling back to Piper", type(exc).__name__)
-        return piper_synthesize(text)
+    except Exception as primary_exc:
+        primary_error = primary_exc  # `as` names are deleted on block exit
+        log.warning("direct TTS failed (%r), falling back to Edge TTS",
+                    primary_error)
+    try:
+        return edge_synthesize(text)
+    except Exception as backup_exc:
+        log.error("Edge TTS also failed (%r); reply will not be spoken",
+                  backup_exc)
+        raise RuntimeError(
+            f"all TTS routes failed: primary Azure: {primary_error!r}; "
+            f"backup Edge: {backup_exc!r}") from backup_exc
 
 
 class ReplyCollector:
@@ -508,7 +503,7 @@ async def play_pool_cue(filler, pools, pool_name, audio, button_events: queue.Qu
 async def speak_text(text: str, audio, button_events: queue.Queue,
                    wake_queue: queue.Queue | None = None,
                    hook_interrupt: bool = False) -> str:
-    """Synthesize (Azure, then Piper) and play through `audio`'s 24 kHz
+    """Synthesize (Azure, then Edge) and play through `audio`'s 24 kHz
     frame sink. Returns "ok", "cancelled-mute", "cancelled-pair",
     "interrupted", "tts_failed", or "audio_failed". `wake_queue` and
     `hook_interrupt` enable formal-playback interrupts (step 3); callers
@@ -516,7 +511,8 @@ async def speak_text(text: str, audio, button_events: queue.Queue,
     try:
         wav = await asyncio.to_thread(_synthesize_with_fallback, text)
     except Exception as exc:
-        log.warning("speak failed at synthesis (%s)", type(exc).__name__)
+        log.warning("speak failed at synthesis (%s: %s)",
+                    type(exc).__name__, exc)
         return "tts_failed"
     try:
         frames = wav_bytes_to_frames(wav)

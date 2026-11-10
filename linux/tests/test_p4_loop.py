@@ -1651,3 +1651,57 @@ def test_vad_phase_feeds_and_reads(tmp_path, monkeypatch):
     finally:
         vad.stop()
     assert not vad.alive()
+
+
+# ---- WK-230: TTS routes are Azure primary + Edge backup, no local leg ----
+
+def _riff(tag: bytes) -> bytes:
+    return b"RIFF" + tag + b"\x00" * 32
+
+
+def test_tts_fallback_uses_edge_when_primary_fails(monkeypatch, caplog):
+    import musegadget.p4_loop as lp
+
+    def boom(text):
+        raise OSError("azure unreachable")
+
+    monkeypatch.setattr(lp, "yunxi_synthesize", boom)
+    monkeypatch.setattr(lp, "edge_synthesize", lambda text: _riff(b"edge"))
+    with caplog.at_level("WARNING"):
+        assert lp._synthesize_with_fallback("你好") == _riff(b"edge")
+    assert "falling back to Edge TTS" in caplog.text
+
+
+def test_tts_primary_success_skips_edge(monkeypatch):
+    import musegadget.p4_loop as lp
+
+    called = []
+    monkeypatch.setattr(lp, "yunxi_synthesize", lambda text: _riff(b"azur"))
+    monkeypatch.setattr(
+        lp, "edge_synthesize",
+        lambda text: called.append(text) or _riff(b"edge"))
+    assert lp._synthesize_with_fallback("你好") == _riff(b"azur")
+    assert called == []
+
+
+def test_tts_both_routes_fail_raises_with_both_errors(monkeypatch, caplog):
+    import musegadget.p4_loop as lp
+
+    def boom_primary(text):
+        raise OSError("azure unreachable")
+
+    def boom_backup(text):
+        raise RuntimeError("edge handshake 403")
+
+    monkeypatch.setattr(lp, "yunxi_synthesize", boom_primary)
+    monkeypatch.setattr(lp, "edge_synthesize", boom_backup)
+    with caplog.at_level("WARNING"):
+        try:
+            lp._synthesize_with_fallback("你好")
+        except RuntimeError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("expected RuntimeError")
+    assert "azure unreachable" in message
+    assert "edge handshake 403" in message
+    assert "Edge TTS also failed" in caplog.text
