@@ -18,6 +18,7 @@ from musegadget.p4_loop import (
     VadStop,
     WakePhase,
     build_ssml,
+    cap_silences,
     frame_rms,
     load_filler_module,
     parse_button_line,
@@ -1770,3 +1771,56 @@ def test_tts_both_routes_fail_raises_with_both_errors(monkeypatch, caplog):
     assert "azure unreachable" in message
     assert "edge handshake 403" in message
     assert "Edge TTS also failed" in caplog.text
+
+
+# --- Silence capping of synthesized reply audio (2026-11-11) ---
+
+def _tone_pcm(seconds, rate=22050, amp=8000):
+    n = int(rate * seconds)
+    return b"".join(
+        struct.pack("<h", amp if i % 2 == 0 else -amp) for i in range(n))
+
+
+def _sil_pcm(seconds, rate=22050):
+    return b"\x00\x00" * int(rate * seconds)
+
+
+def _wav_duration(wav_bytes):
+    import io
+    with wave.open(io.BytesIO(wav_bytes), "rb") as handle:
+        return handle.getnframes() / handle.getframerate()
+
+
+def test_cap_silences_shortens_long_dead_air():
+    rate = 22050
+    wav = wrap_wav(_tone_pcm(0.5, rate) + _sil_pcm(0.8, rate)
+                   + _tone_pcm(0.5, rate), rate)
+    out = cap_silences(wav)
+    # 0.8 s of dead air is capped to the 0.25 s keep; tolerance is two
+    # 10 ms frame grains because boundary frames carry speech energy
+    assert abs(_wav_duration(out) - (0.5 + 0.25 + 0.5)) <= 0.02
+
+
+def test_cap_silences_keeps_short_pauses_and_speech():
+    rate = 22050
+    wav = wrap_wav(_tone_pcm(0.5, rate) + _sil_pcm(0.2, rate)
+                   + _tone_pcm(0.5, rate), rate)
+    assert cap_silences(wav) == wav
+
+
+def test_cap_silences_caps_trailing_dead_air_too():
+    rate = 22050
+    wav = wrap_wav(_tone_pcm(0.4, rate) + _sil_pcm(0.9, rate), rate)
+    out = cap_silences(wav)
+    assert abs(_wav_duration(out) - (0.4 + 0.25)) <= 0.02
+
+
+def test_cap_silences_passes_garbage_through():
+    assert cap_silences(b"not a wav at all") == b"not a wav at all"
+
+
+def test_cap_silences_leaves_quiet_speech_alone():
+    # sustained soft tone above the dead-air floor is not silence
+    rate = 22050
+    wav = wrap_wav(_tone_pcm(1.0, rate, amp=1500), rate)
+    assert cap_silences(wav) == wav

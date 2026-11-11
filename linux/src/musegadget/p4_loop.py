@@ -344,17 +344,84 @@ def edge_synthesize(text: str) -> bytes:
     return synthesize_edge_wav(text)
 
 
+# Dead-air capping for online-synthesized reply audio (user ruling
+# 2026-11-11): both TTS routes render punctuation as long stretches of
+# near-digital silence (measured 0.45-0.68 s per mark, 3.4 s of dead
+# air in one 8.8 s reply), which listeners hear as the speech
+# "breaking". Runs of dead air at least SILENCE_CAP_TRIGGER_S long are
+# shortened to SILENCE_CAP_KEEP_S; anything shorter is natural prosody
+# and stays. Only the online reply path is capped - the pre-recorded
+# fixed clips never pass through here.
+SILENCE_CAP_KEEP_S = 0.25
+SILENCE_CAP_TRIGGER_S = 0.30
+SILENCE_FLOOR_RMS = 184  # int16 RMS below this is dead air (~-45 dBFS)
+
+
+def cap_silences(wav: bytes) -> bytes:
+    """Shorten over-long dead-air runs in a synthesized WAV.
+
+    Works on 10 ms frames of the decoded PCM. Any failure (unparsable
+    WAV, odd format) returns the input unchanged: capping must never
+    lose a reply."""
+    try:
+        pcm, rate = read_tts_wav(wav)
+        samples = memoryview(pcm).cast("h")
+        frame_n = max(1, int(rate * 0.01))
+        keep_n = int(rate * SILENCE_CAP_KEEP_S)
+        trigger_n = int(rate * SILENCE_CAP_TRIGGER_S)
+
+        def frame_rms_at(i: int) -> float:
+            frame = samples[i:i + frame_n]
+            if len(frame) == 0:
+                return float(SILENCE_FLOOR_RMS)
+            acc = 0
+            for v in frame:
+                acc += v * v
+            return (acc / len(frame)) ** 0.5
+
+        parts = []
+        runs = 0
+        kept = 0
+        i = 0
+        total = len(samples)
+        while i < total:
+            if frame_rms_at(i) >= SILENCE_FLOOR_RMS:
+                parts.append(pcm[i * 2:(i + frame_n) * 2])
+                kept += min(frame_n, total - i)
+                i += frame_n
+                continue
+            j = i
+            while j < total and frame_rms_at(j) < SILENCE_FLOOR_RMS:
+                j += frame_n
+            if j - i >= trigger_n:
+                parts.append(pcm[i * 2:(i + keep_n) * 2])
+                kept += keep_n
+                runs += 1
+            else:
+                parts.append(pcm[i * 2:j * 2])
+                kept += j - i
+            i = j
+        if not runs:
+            return wav
+        capped = wrap_wav(b"".join(parts), rate)
+        log.info("silence cap: %.2fs -> %.2fs (%d run(s) capped)",
+                 total / rate, kept / rate, runs)
+        return capped
+    except Exception:
+        return wav
+
+
 def _synthesize_with_fallback(text: str) -> bytes:
     """Primary Azure, backup Edge. Both failing raises a RuntimeError
     carrying both routes' errors so the failure is never silent."""
     try:
-        return yunxi_synthesize(text)
+        return cap_silences(yunxi_synthesize(text))
     except Exception as primary_exc:
         primary_error = primary_exc  # `as` names are deleted on block exit
         log.warning("direct TTS failed (%r), falling back to Edge TTS",
                     primary_error)
     try:
-        return edge_synthesize(text)
+        return cap_silences(edge_synthesize(text))
     except Exception as backup_exc:
         log.error("Edge TTS also failed (%r); reply will not be spoken",
                   backup_exc)
