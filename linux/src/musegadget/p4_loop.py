@@ -367,12 +367,21 @@ class ReplyCollector:
     """Accumulate one text reply from subscribe_chat envelopes (same
     parsing the voice-note test proved): delta.text_append accumulates,
     delta.message_done / message.assistant completes, user-role events
-    are skipped."""
+    are skipped.
+
+    WK-226: a completion carrying no text at all (an agent turn that
+    ended without a visible reply) does NOT complete the round. It is
+    counted in `empty_swallowed`, logged once per message, and the
+    collector keeps waiting for a later message with actual text;
+    only the caller's reply timeout ends a round that never gets one.
+    """
 
     def __init__(self) -> None:
         self.text = ""
         self.message_id: str | None = None
         self.done = False
+        self.empty_swallowed = 0
+        self._swallowed_ids: set = set()
 
     def feed(self, event) -> None:
         if not isinstance(event, dict) or self.done:
@@ -388,12 +397,25 @@ class ReplyCollector:
                 self.message_id = mid
         elif name in ("delta.message_done", "message.assistant"):
             text = payload.get("text")
+            if not (isinstance(text, str) and text):
+                text = payload.get("display_text")
             if isinstance(text, str) and text and not self.text:
                 self.text = text
-            if mid and self.message_id is None:
-                self.message_id = mid
-            if self.text or self.message_id:
+            if self.text:
+                if mid and self.message_id is None:
+                    self.message_id = mid
                 self.done = True
+            elif mid is None or mid not in self._swallowed_ids:
+                # Empty completion: an agent turn ended with nothing
+                # to say. Not this round's answer - swallow it, keep
+                # waiting, and leave a countable trace in the log.
+                if mid is not None:
+                    self._swallowed_ids.add(mid)
+                self.empty_swallowed += 1
+                log.info("reply collector: empty completion swallowed "
+                         "(%d, msg %s); still waiting",
+                         self.empty_swallowed, mid)
+                self.message_id = None
 
 
 def load_filler_module(path: str = FILLER_PATH):

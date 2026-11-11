@@ -198,6 +198,46 @@ def test_reply_collector():
     assert whole.done and whole.text == "全文"
 
 
+def test_reply_collector_empty_completion_does_not_complete():
+    # WK-226: an agent turn that ends with an empty message must not
+    # close the round; the collector swallows it and keeps waiting.
+    collector = ReplyCollector()
+    collector.feed({"event": "delta.message_done", "payload": {"message_id": "e1"}})
+    assert not collector.done and collector.text == ""
+    assert collector.empty_swallowed == 1 and collector.message_id is None
+    # A duplicate completion event for the same empty message is not
+    # counted twice.
+    collector.feed({"event": "message.assistant", "payload": {"message_id": "e1"}})
+    assert not collector.done and collector.empty_swallowed == 1
+    # The substantive reply, arriving as a later message, completes.
+    collector.feed(
+        {"event": "delta.text_append",
+         "payload": {"role": "assistant", "text": "实", "message_id": "m9"}}
+    )
+    collector.feed(
+        {"event": "delta.text_append",
+         "payload": {"role": "assistant", "text": "答", "message_id": "m9"}}
+    )
+    assert not collector.done and collector.message_id == "m9"
+    collector.feed({"event": "delta.message_done", "payload": {"message_id": "m9"}})
+    assert collector.done and collector.text == "实答"
+    assert collector.empty_swallowed == 1
+
+
+def test_reply_collector_empty_assistant_snapshot_then_full_one():
+    collector = ReplyCollector()
+    collector.feed(
+        {"event": "message.assistant",
+         "payload": {"text": "", "message_id": "e2"}}
+    )
+    assert not collector.done and collector.empty_swallowed == 1
+    collector.feed(
+        {"event": "message.assistant",
+         "payload": {"display_text": "全文", "message_id": "m10"}}
+    )
+    assert collector.done and collector.text == "全文"
+
+
 class _FakeSink:
     """Frame sink for play_wav_frames tests (no queue limit)."""
 
@@ -1355,7 +1395,32 @@ def test_run_round_discarded_plays_not_heard(tmp_path, monkeypatch):
     assert texts == [NOT_HEARD_TEXT]
 
 
-def test_run_round_empty_reply_plays_not_heard(tmp_path, monkeypatch):
+def test_run_round_empty_completion_then_substantive_reply(tmp_path, monkeypatch):
+    # WK-226: an empty completion (an agent turn that ended without a
+    # visible reply) must not close the round or play the not-heard
+    # cue; the round keeps waiting on the same stream and speaks the
+    # substantive reply when it arrives as a later message.
+    class _EmptyThenReplySession(_FakeSession):
+        async def subscribe_chat(self):
+            yield {"event": "delta.message_done",
+                   "payload": {"role": "assistant", "text": "",
+                               "message_id": "m1"}}
+            yield {"event": "delta.text_append",
+                   "payload": {"role": "assistant", "text": "答复",
+                               "message_id": "m2"}}
+            yield {"event": "delta.message_done",
+                   "payload": {"role": "assistant", "message_id": "m2"}}
+
+    (reason, pair_pending, text), texts = _run_round_step5(
+        tmp_path, monkeypatch, _EmptyThenReplySession, _FakeRoundAudio())
+    assert reason == "ok" and pair_pending is False and text == "答复"
+    assert texts == ["答复"]
+
+
+def test_run_round_only_empty_completion_stream_ends(tmp_path, monkeypatch):
+    # WK-226: a stream that ends after nothing but an empty completion
+    # no longer reports empty_reply / plays the not-heard cue; it falls
+    # through to the no-reply path like any other answerless round.
     class _EmptySession(_FakeSession):
         async def subscribe_chat(self):
             yield {"event": "delta.message_done",
@@ -1364,8 +1429,8 @@ def test_run_round_empty_reply_plays_not_heard(tmp_path, monkeypatch):
 
     (reason, pair_pending, text), texts = _run_round_step5(
         tmp_path, monkeypatch, _EmptySession, _FakeRoundAudio())
-    assert reason == "empty_reply" and pair_pending is False and text is None
-    assert texts == [NOT_HEARD_TEXT]
+    assert reason == "failed" and pair_pending is False and text is None
+    assert texts == [NO_REPLY_TEXT]
 
 
 class _FakeSessionFlaky(_FakeSession):
