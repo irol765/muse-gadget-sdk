@@ -35,6 +35,7 @@ from musegadget.p4_loop import (
     play_pair_prompt,
     wav_bytes_to_frames,
     _CHILDREN,
+    _bounded_round,
     _fetch_vms_with_refresh,
     _shutdown_watchdog,
     wrap_wav,
@@ -1997,3 +1998,99 @@ def test_cap_silences_leaves_quiet_speech_alone():
     rate = 22050
     wav = wrap_wav(_tone_pcm(1.0, rate, amp=1500), rate)
     assert cap_silences(wav) == wav
+
+
+# --- WK-239 chain bounds: a step that overruns discards the round ---
+
+
+class _FakeSessionTransportTimeout(_FakeSession):
+    async def wait_transport_ready(self, timeout):
+        raise TimeoutError
+
+
+class _FakeSessionSlowSend(_FakeSession):
+    async def send_voice(self, wav_bytes):
+        await asyncio.sleep(30)
+        return {"ok": True}
+
+
+def _patch_round_env(monkeypatch, tmp_path, session_cls, synth=None):
+    wav_path = tmp_path / "wake.wav"
+    _write_test_wav(wav_path)
+    monkeypatch.setattr("musegadget.p4_loop.muse_api", _FakeApi)
+    monkeypatch.setattr("musegadget.p4_loop.LinkSession", session_cls)
+    monkeypatch.setattr(
+        "musegadget.p4_loop.load_filler_module",
+        lambda *args, **kwargs: _FakeFillerModule(str(wav_path)),
+    )
+    monkeypatch.setattr(
+        "musegadget.p4_loop._synthesize_with_fallback",
+        synth or (lambda text: wrap_wav(_sine_pcm(4410, 22050), 22050)),
+    )
+
+
+def _run_fake_round(audio):
+    return asyncio.run(
+        run_round(
+            {"access_token": "x", "api_url_v2": ""},
+            "node1", audio, queue.Queue(), None,
+        )
+    )
+
+
+def test_bounded_round_passes_result_through():
+    async def quick():
+        return "ok", False, "hi"
+
+    assert asyncio.run(_bounded_round(quick(), 5)) == ("ok", False, "hi")
+
+
+def test_bounded_round_timeout_discards_and_cancels():
+    cleaned = []
+
+    async def stuck():
+        try:
+            await asyncio.sleep(30)
+        finally:
+            cleaned.append(True)
+
+    reason, pair_pending, text = asyncio.run(_bounded_round(stuck(), 0.2))
+    assert (reason, pair_pending, text) == ("discarded", False, None)
+    assert cleaned == [True]
+
+
+def test_run_round_transport_timeout_discards(tmp_path, monkeypatch):
+    _patch_round_env(monkeypatch, tmp_path, _FakeSessionTransportTimeout)
+    reason, pair_pending, _text = _run_fake_round(_FakeRoundAudio())
+    assert reason == "discarded" and pair_pending is False
+
+
+def test_run_round_send_timeout_discards(tmp_path, monkeypatch):
+    _patch_round_env(monkeypatch, tmp_path, _FakeSessionSlowSend)
+    monkeypatch.setattr("musegadget.p4_loop.SEND_TIMEOUT_S", 0.3)
+    reason, pair_pending, _text = _run_fake_round(_FakeRoundAudio())
+    assert reason == "discarded" and pair_pending is False
+
+
+def test_run_round_synthesis_timeout_discards(tmp_path, monkeypatch):
+    def slow_synth(text):
+        time.sleep(3)
+        return wrap_wav(_sine_pcm(4410, 22050), 22050)
+
+    _patch_round_env(monkeypatch, tmp_path, _FakeSession, synth=slow_synth)
+    monkeypatch.setattr("musegadget.p4_loop.SYNTH_TIMEOUT_S", 0.3)
+    reason, pair_pending, _text = _run_fake_round(_FakeRoundAudio())
+    assert reason == "discarded" and pair_pending is False
+
+
+def test_run_round_vm_lookup_timeout_discards(tmp_path, monkeypatch):
+    async def never_vms(pairing, node_id):
+        await asyncio.sleep(30)
+        return ([], 200)
+
+    _patch_round_env(monkeypatch, tmp_path, _FakeSession)
+    monkeypatch.setattr(
+        "musegadget.p4_loop._fetch_vms_with_refresh", never_vms)
+    monkeypatch.setattr("musegadget.p4_loop.VM_LOOKUP_TIMEOUT_S", 0.3)
+    reason, pair_pending, _text = _run_fake_round(_FakeRoundAudio())
+    assert reason == "discarded" and pair_pending is False

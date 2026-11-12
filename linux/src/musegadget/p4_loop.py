@@ -120,6 +120,34 @@ TTS_ENDPOINT = "https://eastasia.tts.speech.microsoft.com/cognitiveservices/v1"
 TTS_VOICE = "zh-CN-YunxiNeural"
 TTS_TIMEOUT_S = 15
 REPLY_TIMEOUT_S = 180
+# WK-239 chain bounds: every step of a round has a ceiling, and the
+# round as a whole has one too. A step that overruns ends the round
+# as "discarded" with one clear log line instead of wedging the loop
+# (2026-11-12: the car Wi-Fi dropped mid-round, the reply chain hung
+# with it, and the open round never came back). Each value sits above
+# the step's own inner timeout: VM lookup (urllib 15 s a call, up to
+# four calls with a token refresh), send (the link layer's own 60 s
+# request timeout), synthesis (15 s primary plus 20 s fallback), and
+# a whole-round ceiling above the designed stack (180 s reply wait,
+# 35 s transport wait, 30 s record cap, playback included).
+VM_LOOKUP_TIMEOUT_S = 75
+SEND_TIMEOUT_S = 75
+SYNTH_TIMEOUT_S = 60
+ROUND_TIMEOUT_S = 540
+
+
+class _StepTimeout(Exception):
+    """One step of a round overran its chain ceiling (WK-239).
+
+    Raised inside run_round and converted by its handler into a
+    "discarded" round end with one clear log line naming the step,
+    so a network that dies mid-round closes the round and returns
+    the loop to standby instead of wedging it."""
+
+    def __init__(self, step: str, limit_s: float) -> None:
+        super().__init__(step)
+        self.step = step
+        self.limit_s = limit_s
 MAX_SUBSCRIBE_SKIPS = 10
 
 # Failure feedback phrases (Pi3 live wording, loop.py:1263/1358):
@@ -600,7 +628,11 @@ async def speak_text(text: str, audio, button_events: queue.Queue,
     `hook_interrupt` enable formal-playback interrupts (step 3); callers
     that leave them unset get the old mute/pair-only behavior."""
     try:
-        wav = await asyncio.to_thread(_synthesize_with_fallback, text)
+        wav = await asyncio.wait_for(
+            asyncio.to_thread(_synthesize_with_fallback, text),
+            SYNTH_TIMEOUT_S)
+    except TimeoutError:
+        raise _StepTimeout("synthesis", SYNTH_TIMEOUT_S) from None
     except Exception as exc:
         log.warning("speak failed at synthesis (%s: %s)",
                     type(exc).__name__, exc)
@@ -2013,7 +2045,15 @@ async def run_round(
                 log.warning("AEC disable failed (%s)", type(exc).__name__)
 
     try:
-        vms, status = await _fetch_vms_with_refresh(pairing, node_id)
+        vms, status = await asyncio.wait_for(
+            _fetch_vms_with_refresh(pairing, node_id),
+            VM_LOOKUP_TIMEOUT_S)
+    except TimeoutError:
+        log.warning(
+            "round discarded: VM lookup exceeded %.0fs (link down?)",
+            VM_LOOKUP_TIMEOUT_S)
+        await _cancel_cue()
+        return "discarded", False, None
     except RuntimeError:
         log.warning("round failed: pairing revoked, need re-pair")
         await _cancel_cue()
@@ -2044,7 +2084,10 @@ async def run_round(
     stop = asyncio.Event()
     connection = asyncio.create_task(session.run(stop))
     try:
-        await session.wait_transport_ready(35)
+        try:
+            await session.wait_transport_ready(35)
+        except TimeoutError:
+            raise _StepTimeout("transport", 35) from None
         # --- wake prompt (started before registration, awaited here) ---
         # The cue plays concurrently with registration; the ring keeps
         # speech from the cue and registration window, so the record
@@ -2174,7 +2217,12 @@ async def run_round(
         collect_task = asyncio.create_task(collect())
         await asyncio.sleep(0.5)
         try:
-            result = await session.send_voice(wav_bytes)
+            result = await asyncio.wait_for(
+                session.send_voice(wav_bytes), SEND_TIMEOUT_S)
+        except TimeoutError:
+            collect_task.cancel()
+            await asyncio.gather(collect_task, return_exceptions=True)
+            raise _StepTimeout("send", SEND_TIMEOUT_S) from None
         except Exception as exc:
             log.warning("round failed at send (%s)", type(exc).__name__)
             collect_task.cancel()
@@ -2309,6 +2357,15 @@ async def run_round(
         if collect_task.done():
             return "failed", False, None
         return "reply_timeout", False, None
+    except _StepTimeout as exc:
+        log.error(
+            "round discarded: %s step exceeded %.0fs (link down?); "
+            "back to standby", exc.step, exc.limit_s)
+        await _cancel_cue()
+        _disarm()
+        if await play_failure_feedback(NO_REPLY_TEXT, audio, button_events) == "cancelled-pair":
+            return "cancelled-pair", True, None
+        return "discarded", False, None
     except Exception as exc:
         log.warning("round failed (%s)", type(exc).__name__)
         await _cancel_cue()
@@ -2365,6 +2422,24 @@ def _shutdown_watchdog(stop_event: threading.Event,
         "shutdown: still alive %.0fs after force-kill; exiting directly",
         grace_kill_s + grace_exit_s)
     (exit_fn or os._exit)(3)
+
+
+async def _bounded_round(coro, timeout_s: float):
+    """Run one round under a whole-chain ceiling (WK-239).
+
+    Every step inside the round has its own bound; this is the
+    backstop for a stack of individually slow steps or an await
+    nobody bounded. On timeout the round coroutine is cancelled
+    (its own cleanup is bounded) and the round reports
+    "discarded": the loop returns to standby instead of wedging
+    on a round that never returns."""
+    try:
+        return await asyncio.wait_for(coro, timeout_s)
+    except TimeoutError:
+        log.error(
+            "round discarded: whole round exceeded %.0fs ceiling; "
+            "back to standby", timeout_s)
+        return "discarded", False, None
 
 
 def run_loop(args: argparse.Namespace) -> int:
@@ -2483,14 +2558,16 @@ def run_loop(args: argparse.Namespace) -> int:
                     break
                 try:
                     reason, pair_pending, _reply = asyncio.run(
-                        run_round(
-                            pairing, ident.node_id, audio, button_events, args.proxy,
-                            wake_prompt=(trigger == "wake" and first_round
-                                         and not window_round),
-                            wake=wake,
-                            wake_queue=wake_queue,
-                            vad=vad,
-                        )
+                        _bounded_round(
+                            run_round(
+                                pairing, ident.node_id, audio, button_events, args.proxy,
+                                wake_prompt=(trigger == "wake" and first_round
+                                             and not window_round),
+                                wake=wake,
+                                wake_queue=wake_queue,
+                                vad=vad,
+                            ),
+                            ROUND_TIMEOUT_S)
                     )
                 finally:
                     audio.close()
