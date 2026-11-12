@@ -756,6 +756,49 @@ class LinearAec:
             pass
 
 
+class _ChildRegistry:
+    """Every subprocess this module spawns, so the shutdown watchdog
+    can force-kill whatever is still alive after a stop request
+    instead of leaving the service for systemd's timeout SIGKILL.
+    Registration is bookkeeping only; owners keep managing their own
+    processes exactly as before."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._procs: set = set()
+
+    def register(self, proc) -> None:
+        with self._lock:
+            self._procs.add(proc)
+
+    def unregister(self, proc) -> None:
+        with self._lock:
+            self._procs.discard(proc)
+
+    def kill_all(self) -> int:
+        with self._lock:
+            procs = list(self._procs)
+        killed = 0
+        for proc in procs:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                    killed += 1
+            except Exception:
+                pass
+        return killed
+
+
+_CHILDREN = _ChildRegistry()
+
+
+def _close_quietly(stream) -> None:
+    try:
+        stream.close()
+    except Exception:
+        pass
+
+
 class CaptureHub:
     """One resident capture feeding a ring buffer, a wake tap, and
     per-round record queues.
@@ -780,6 +823,7 @@ class CaptureHub:
     WAKE_QUEUE_CHUNKS = 25  # 1 s of slack for the wake writer
     RELAUNCH_DELAY_S = 0.2
     STALL_S = 2.0  # no chunk this long means capture is broken
+    STALL_KILL_S = 3.0  # no chunk this long: kill arecord, do not wait for death
 
     def __init__(self, device: str = DEFAULT_ARECORD_DEVICE, spawn=None) -> None:
         self._device = device
@@ -795,7 +839,9 @@ class CaptureHub:
         self._stopped = threading.Event()
         self._started = False
         self._reader: threading.Thread | None = None
+        self._watchdog: threading.Thread | None = None
         self._proc = None
+        self._proc_born_t: float | None = None
         self._last_chunk_t: float | None = None
 
     def _default_spawn(self):
@@ -811,6 +857,8 @@ class CaptureHub:
         self._stopped.clear()
         self._reader = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader.start()
+        self._watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
+        self._watchdog.start()
 
     @property
     def stopped(self) -> bool:
@@ -937,6 +985,8 @@ class CaptureHub:
                 self._stopped.wait(self.RELAUNCH_DELAY_S)
                 continue
             self._proc = proc
+            self._proc_born_t = time.monotonic()
+            _CHILDREN.register(proc)
             try:
                 assert proc.stdout is not None
                 while not self._stopped.is_set():
@@ -948,9 +998,33 @@ class CaptureHub:
                 log.warning("capture read failed (%s)", type(exc).__name__)
             finally:
                 self._kill_proc(proc)
+                _CHILDREN.unregister(proc)
                 self._proc = None
+                self._proc_born_t = None
             if not self._stopped.is_set():
                 self._stopped.wait(self.RELAUNCH_DELAY_S)
+
+    def _watchdog_loop(self) -> None:
+        # An arecord that stays alive but stops delivering chunks is
+        # as wedged as a dead one, and the reader cannot notice: it is
+        # the thread blocked in read(). Kill the process here; the
+        # reader sees EOF and relaunches, as for a death.
+        while not self._stopped.wait(0.5):
+            proc = self._proc
+            if proc is None:
+                continue
+            try:
+                if proc.poll() is not None:
+                    continue
+            except Exception:
+                continue
+            refs = [t for t in (self._last_chunk_t, self._proc_born_t)
+                    if t is not None]
+            if refs and time.monotonic() - max(refs) > self.STALL_KILL_S:
+                log.warning(
+                    "capture stalled: no chunk for over %.0fs, killing arecord",
+                    self.STALL_KILL_S)
+                self._kill_proc(proc)
 
     def snapshot(self, count: int = PRE_ROLL_CHUNKS) -> list[bytes]:
         with self._lock:
@@ -994,6 +1068,8 @@ class CaptureHub:
         if reader is not None:
             reader.join(timeout=2)
         self._reader = None
+        if proc is not None:
+            _CHILDREN.unregister(proc)
 
 
 class P4Audio:
@@ -1011,6 +1087,9 @@ class P4Audio:
 
     CAPTURE_RATE = CaptureHub.CAPTURE_RATE
     CAPTURE_CHUNK = CaptureHub.CAPTURE_CHUNK
+    PLAYBACK_STALL_S = 4.0  # one frame write stuck this long: aplay is wedged
+    CLOSE_STDIN_JOIN_S = 1.0  # max wait for the stdin close itself
+    CLOSE_WAIT_S = 2.0  # per step of the close ladder (exit/terminate/kill)
 
     def __init__(self, record_device: str = DEFAULT_ARECORD_DEVICE,
                  play_device: str = DEFAULT_APLAY_DEVICE,
@@ -1023,6 +1102,8 @@ class P4Audio:
         self._playback: queue.Queue[bytes] = queue.Queue(maxsize=8)
         self._closed = False
         self._playback_dead = False
+        self._write_in_flight = False
+        self._write_started_t: float | None = None
         self._record_queue: queue.Queue | None = None
         if hub is None:
             self._hub = CaptureHub(record_device)
@@ -1043,9 +1124,13 @@ class P4Audio:
         if self._aplay.poll() is not None:
             self.close()
             raise RuntimeError(f"aplay exited immediately (rc={self._aplay.returncode})")
+        _CHILDREN.register(self._aplay)
         log.info("audio: aplay pid=%d (capture via shared hub)", self._aplay.pid)
         self._playback_thread = threading.Thread(target=self._playback_loop, daemon=True)
         self._playback_thread.start()
+        self._playback_watchdog = threading.Thread(
+            target=self._playback_watchdog_loop, daemon=True)
+        self._playback_watchdog.start()
 
     def _playback_loop(self) -> None:
         assert self._aplay.stdin is not None
@@ -1053,13 +1138,49 @@ class P4Audio:
             while True:
                 pcm = self._playback.get()
                 try:
-                    self._aplay.stdin.write(pcm)
-                    self._aplay.stdin.flush()
+                    self._write_started_t = time.monotonic()
+                    self._write_in_flight = True
+                    try:
+                        self._aplay.stdin.write(pcm)
+                        self._aplay.stdin.flush()
+                    finally:
+                        self._write_in_flight = False
                 except (BrokenPipeError, OSError):
                     self._playback_dead = True
                     return
         except Exception:
             self._playback_dead = True
+
+    def _playback_watchdog_loop(self) -> None:
+        # A single frame write that blocks for seconds means aplay is
+        # alive but no longer consuming (the BT channel wedged under
+        # it). The writer thread cannot time itself out from inside
+        # the blocked write, and close() cannot proceed while the
+        # write holds the stream lock: kill the process from here.
+        # The write then fails, playback reports dead, and the round
+        # ends instead of wedging the whole loop.
+        while not self._closed:
+            time.sleep(0.25)
+            proc = getattr(self, "_aplay", None)
+            if proc is None:
+                return
+            try:
+                if proc.poll() is not None:
+                    return
+            except Exception:
+                return
+            if (self._write_in_flight and self._write_started_t is not None
+                    and time.monotonic() - self._write_started_t
+                    > self.PLAYBACK_STALL_S):
+                log.warning(
+                    "playback write stalled over %.0fs; killing aplay pid=%d",
+                    self.PLAYBACK_STALL_S, proc.pid)
+                self._playback_dead = True
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                return
 
     async def frames(self):
         # Pre-roll first: the hub ring's last 1 s, then live chunks.
@@ -1135,25 +1256,35 @@ class P4Audio:
             # and exits on its own. Signals are only a fallback, and
             # every path waits, so no zombie is left behind and the
             # audio device is never left held by a killed stream.
+            # The close itself runs on a helper thread with a bounded
+            # join: when a writer is wedged inside a write, closing
+            # the stream from here would block on the same stream
+            # lock and wedge the caller too. If the close does not
+            # land in time, the ladder below kills the process,
+            # which also releases the stuck close.
             if proc.stdin is not None:
-                try:
-                    proc.stdin.close()
-                except Exception:
-                    pass
+                closer = threading.Thread(
+                    target=_close_quietly, args=(proc.stdin,), daemon=True)
+                closer.start()
+                closer.join(timeout=self.CLOSE_STDIN_JOIN_S)
             try:
-                proc.wait(timeout=2)
+                proc.wait(timeout=self.CLOSE_WAIT_S)
             except subprocess.TimeoutExpired:
                 proc.terminate()
                 try:
-                    proc.wait(timeout=2)
+                    proc.wait(timeout=self.CLOSE_WAIT_S)
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     try:
-                        proc.wait(timeout=2)
+                        proc.wait(timeout=self.CLOSE_WAIT_S)
                     except Exception:
                         pass
             except Exception:
                 pass
+            _CHILDREN.unregister(proc)
+            thread = getattr(self, "_playback_thread", None)
+            if thread is not None:
+                thread.join(timeout=1)
         self._close_hub_if_owned()
 
     def _close_hub_if_owned(self) -> None:
@@ -1279,6 +1410,7 @@ class WakePhase:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
+        _CHILDREN.register(self._sherpa)
         assert self._sherpa.stdout is not None and self._sherpa.stdin is not None
         self._reader = threading.Thread(
             target=self._read_loop, args=(self._sherpa.stdout,), daemon=True)
@@ -1344,6 +1476,7 @@ class WakePhase:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 proc.kill()
+            _CHILDREN.unregister(proc)
 
     def stop(self) -> None:
         self._writer_stop.set()
@@ -1391,6 +1524,7 @@ class VadPhase:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
+        _CHILDREN.register(self._proc)
         assert self._proc.stdout is not None and self._proc.stdin is not None
         self._drain(self._feed)
         self._drain(self._decisions)
@@ -1424,6 +1558,7 @@ class VadPhase:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 proc.kill()
+            _CHILDREN.unregister(proc)
 
     def stop(self) -> None:
         self._writer_stop.set()
@@ -2198,6 +2333,40 @@ def _version() -> str:
     return version
 
 
+def _shutdown_watchdog(stop_event: threading.Event,
+                       grace_kill_s: float = 6.0,
+                       grace_exit_s: float = 5.0,
+                       kill_children=None,
+                       exit_fn=None) -> None:
+    """Bounded self-stop after a stop request, owned by this process
+    rather than by systemd's timeout SIGKILL.
+
+    The signal handler only sets `stop_event`, and parts of the loop
+    notice it late (a round in flight) or never (a thread wedged in a
+    blocking call). Once the event is set, a healthy shutdown exits
+    within a second or two and this daemon thread dies with the
+    process. If the process is still alive after `grace_kill_s`,
+    force-kill every registered child: a wedged audio subprocess is
+    the usual blocker, and killing it unwinds the round machinery so
+    the normal exit path can run. Still alive after another
+    `grace_exit_s`: exit directly."""
+    stop_event.wait()
+    deadline = time.monotonic() + grace_kill_s
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+    killed = (kill_children or _CHILDREN.kill_all)()
+    log.warning(
+        "shutdown: stop not complete in %.0fs; force-killed %d child process(es)",
+        grace_kill_s, killed)
+    deadline = time.monotonic() + grace_exit_s
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+    log.error(
+        "shutdown: still alive %.0fs after force-kill; exiting directly",
+        grace_kill_s + grace_exit_s)
+    (exit_fn or os._exit)(3)
+
+
 def run_loop(args: argparse.Namespace) -> int:
     """Wake -> round -> window -> idle, forever (systemd restarts on failure)."""
     logging.basicConfig(
@@ -2211,6 +2380,8 @@ def run_loop(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
+    threading.Thread(target=_shutdown_watchdog, args=(stop_event,),
+                     daemon=True, name="shutdown-watchdog").start()
 
     button_events: queue.Queue = queue.Queue()
     ButtonReader(args.fifo, button_events).start()

@@ -34,7 +34,9 @@ from musegadget.p4_loop import (
     REPLY_TIMEOUT_S,
     play_pair_prompt,
     wav_bytes_to_frames,
+    _CHILDREN,
     _fetch_vms_with_refresh,
+    _shutdown_watchdog,
     wrap_wav,
     WINDOW_TIMEOUT_TEXT,
     WINDOW_VOICE_FRAMES,
@@ -582,6 +584,177 @@ def test_p4audio_frames_stalled_capture_raises():
         assert asyncio.run(drain())
     finally:
         hub.stop()
+
+
+def test_capture_hub_kills_stalled_arecord_and_relaunches():
+    first = _ChunkStream()
+    second = _ChunkStream()
+    calls = []
+
+    def spawn():
+        calls.append(1)
+        return _FakeProc(first if len(calls) == 1 else second)
+
+    hub = CaptureHub("hw:FAKE,0", spawn=spawn)
+    hub.STALL_KILL_S = 0.4
+    hub.start()
+    try:
+        first.feed(_chunk(0))
+        first.feed(_chunk(1))
+        assert _wait_until(lambda: len(hub.snapshot()) == 2)
+        # First arecord stays alive but goes silent: the watchdog
+        # must kill it (its stream closes, the reader relaunches)
+        # instead of leaving every round to starve.
+        assert _wait_until(lambda: len(calls) >= 2)
+        second.feed(_chunk(50))
+        assert _wait_until(lambda: _chunk(50) in hub.snapshot(125))
+    finally:
+        hub.stop()
+
+
+class _WedgedStdin:
+    """Playback stdin whose write blocks until the proc is killed."""
+
+    def __init__(self):
+        self.released = threading.Event()
+
+    def write(self, data):
+        self.released.wait(10)
+        raise BrokenPipeError("wedged pipe released by the kill")
+
+    def flush(self):
+        pass
+
+
+class _WedgedProc:
+    pid = 4242
+
+    def __init__(self):
+        self.stdin = _WedgedStdin()
+        self.killed = False
+        self._dead = False
+
+    def poll(self):
+        return 0 if self._dead else None
+
+    def kill(self):
+        self.killed = True
+        self._dead = True
+        self.stdin.released.set()
+
+    def terminate(self):
+        self.kill()
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def _bare_p4audio(proc):
+    audio = object.__new__(P4Audio)
+    audio._aplay = proc
+    audio._playback = queue.Queue(maxsize=8)
+    audio._closed = False
+    audio._playback_dead = False
+    audio._write_in_flight = False
+    audio._write_started_t = None
+    audio._record_queue = None
+    audio._hub = None
+    audio._hub_owned = False
+    return audio
+
+
+def test_p4audio_playback_watchdog_kills_wedged_aplay():
+    proc = _WedgedProc()
+    audio = _bare_p4audio(proc)
+    audio.PLAYBACK_STALL_S = 0.3
+    audio._playback_thread = threading.Thread(
+        target=audio._playback_loop, daemon=True)
+    audio._playback_thread.start()
+    watchdog = threading.Thread(
+        target=audio._playback_watchdog_loop, daemon=True)
+    watchdog.start()
+    try:
+        audio._playback.put(b"\x00" * 1920)
+        assert _wait_until(lambda: proc.killed)
+        assert _wait_until(lambda: audio._playback_dead)
+    finally:
+        audio._closed = True
+        watchdog.join(timeout=2)
+        audio._playback_thread.join(timeout=2)
+
+
+class _BlockingCloseStdin:
+    """stdin whose close() blocks until the proc is killed."""
+
+    def __init__(self, proc):
+        self._proc = proc
+
+    def close(self):
+        self._proc.close_released.wait(10)
+
+    def write(self, data):
+        return len(data)
+
+    def flush(self):
+        pass
+
+
+class _StubbornProc:
+    pid = 4343
+
+    def __init__(self):
+        self.close_released = threading.Event()
+        self.stdin = _BlockingCloseStdin(self)
+        self.terminated = False
+        self.killed = False
+        self._dead = False
+
+    def poll(self):
+        return 0 if self._dead else None
+
+    def wait(self, timeout=None):
+        if self._dead:
+            return 0
+        import subprocess
+        raise subprocess.TimeoutExpired("fake-aplay", timeout)
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+        self._dead = True
+        self.close_released.set()
+
+
+def test_p4audio_close_bounded_when_stdin_close_blocks():
+    proc = _StubbornProc()
+    audio = _bare_p4audio(proc)
+    audio.CLOSE_STDIN_JOIN_S = 0.2
+    audio.CLOSE_WAIT_S = 0.2
+    started = time.monotonic()
+    audio.close()
+    elapsed = time.monotonic() - started
+    # The full ladder is 0.2 (stdin join) + 0.2 (exit wait) + 0.2
+    # (terminate wait) plus slack: far below the unbounded hang this
+    # guards against.
+    assert elapsed < 3.0
+    assert proc.terminated and proc.killed
+
+
+def test_shutdown_watchdog_kills_children_then_exits():
+    proc = _WedgedProc()
+    _CHILDREN.register(proc)
+    exits = []
+    stop_event = threading.Event()
+    stop_event.set()
+    try:
+        _shutdown_watchdog(stop_event, grace_kill_s=0.3, grace_exit_s=0.3,
+                           exit_fn=exits.append)
+    finally:
+        _CHILDREN.unregister(proc)
+    assert proc.killed
+    assert exits == [3]
 
 
 def test_wake_phase_requires_hub():
